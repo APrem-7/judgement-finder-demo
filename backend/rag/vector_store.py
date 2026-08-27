@@ -6,7 +6,7 @@ import json
 import numpy as np
 import faiss
 from pathlib import Path
-from ..config import settings
+from config import settings
 
 _index: faiss.IndexFlatIP | None = None
 _id_map: list[int] = []          # faiss position → DB case_id
