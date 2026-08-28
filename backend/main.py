@@ -18,6 +18,7 @@ from db.models import CaseLaw, ModelTestResult
 from pipeline.ingestion import load_dataset, row_to_dict
 from pipeline.anonymizer import anonymize
 from pipeline.document_creator import create_document
+from pipeline.pdf_extractor import extract_text_from_pdf, extract_metadata_via_llm, strip_thinking
 from llm.groq_client import chat
 from llm.model_tester import run_model_test, MODELS
 from llm.prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
@@ -96,6 +97,15 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
         anon_respondent = "Jane Doe"
         anon_judges = "Honourable Bench"
 
+        # Look up what placeholders were used for the known names
+        for placeholder, original in anon.pii_map.items():
+            if original == row_dict.get("petitioner"):
+                anon_petitioner = placeholder
+            elif original == row_dict.get("respondent"):
+                anon_respondent = placeholder
+            elif original == row_dict.get("judges"):
+                anon_judges = placeholder
+
         case = CaseLaw(
             original_case_no=row_dict.get("case_no") or None,
             judgment_date=row_dict.get("date") or None,
@@ -144,14 +154,19 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
         return None
 
 
-def _generate_summary(anonymized_text: str, model_id: str = "qwen/qwen3.6-27b") -> str:
+def _generate_summary(anonymized_text: str, model_id: str = "groq/compound") -> str:
     truncated = anonymized_text[:6000]
     user_msg = USER_PROMPT_TEMPLATE.format(anonymized_text=truncated)
-    resp = chat(model_id, SYSTEM_PROMPT, user_msg, max_tokens=1200)
+    resp = chat(model_id, SYSTEM_PROMPT, user_msg, max_tokens=1500)
     if resp["error"] or not resp["text"]:
-        # Fallback to GPT OSS if Qwen fails
-        resp = chat("openai/gpt-oss-20b", SYSTEM_PROMPT, user_msg, max_tokens=1200)
-    return resp["text"] or "[Summary generation failed]"
+        # Fallback to compound-mini if compound fails
+        resp = chat("groq/compound-mini", SYSTEM_PROMPT, user_msg, max_tokens=1500)
+        if resp["error"] or not resp["text"]:
+            # Fallback to qwen with higher tokens to accommodate its reasoning block
+            resp = chat("qwen/qwen3.6-27b", SYSTEM_PROMPT, user_msg, max_tokens=3500)
+            
+    summary_text = resp["text"] or ""
+    return strip_thinking(summary_text) or "[Summary generation failed]"
 
 
 @app.post("/api/ingest/bulk", response_model=BulkIngestResponse)
@@ -194,6 +209,61 @@ async def bulk_ingest(
         skipped=skipped,
         message=f"Ingested {ingested} cases into pipeline. {len(test_df)} cases reserved for LLM testing.",
     )
+
+
+class PdfIngestResponse(BaseModel):
+    success: bool
+    case_id: int | None
+    message: str
+
+
+@app.post("/api/ingest/pdf", response_model=PdfIngestResponse)
+async def ingest_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are accepted")
+
+    tmp_path = settings.data_path() / file.filename
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.write_bytes(await file.read())
+
+    print(f"DEBUG: Processing PDF from {tmp_path}")
+    try:
+        raw_text = extract_text_from_pdf(tmp_path)
+        if not raw_text or len(raw_text) < 50:
+            raise ValueError("Could not extract sufficient text from PDF")
+
+        print(f"DEBUG: Extracted {len(raw_text)} chars from PDF. Requesting metadata extraction via LLM...")
+        metadata = extract_metadata_via_llm(raw_text)
+        print(f"DEBUG: LLM Metadata extraction result: {metadata}")
+
+        row_dict = {
+            "text": raw_text,
+            "case_no": metadata.get("case_no"),
+            "date": metadata.get("date"),
+            "petitioner": metadata.get("petitioner"),
+            "respondent": metadata.get("respondent"),
+            "judges": metadata.get("judges"),
+            "subject": metadata.get("subject"),
+            "acts": metadata.get("acts"),
+            "verdict": metadata.get("verdict"),
+        }
+
+        case = _process_row(row_dict, db)
+        if case:
+            db.commit()
+            return PdfIngestResponse(success=True, case_id=case.id, message="Successfully ingested PDF case.")
+        else:
+            return PdfIngestResponse(success=False, case_id=None, message="Failed to process case after metadata extraction.")
+            
+    except Exception as e:
+        print(f"ERROR: Failed to ingest PDF: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Error processing PDF: {str(e)}")
 
 
 # ─── Cases ────────────────────────────────────────────────────────────────────
