@@ -20,3 +20,7 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+
+#data files of cases that the user uploads
+backend/data/*
+!backend/data/.gitkeep
