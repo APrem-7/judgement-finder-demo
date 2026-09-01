@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from db.database import engine, get_db, Base
-from db.models import CaseLaw, ModelTestResult
+from db.models import CaseLaw, ModelTestResult, IngestionLog
 from pipeline.ingestion import load_dataset, row_to_dict
 from pipeline.anonymizer import anonymize
 from pipeline.document_creator import create_document
@@ -76,11 +76,41 @@ class BulkIngestResponse(BaseModel):
     message: str
 
 
-def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
+def _validate_metadata(row_dict: dict) -> tuple[bool, str]:
+    """Validate that essential metadata fields are present."""
+    required_fields = ["text"]
+    missing = []
+    
+    for field in required_fields:
+        if not row_dict.get(field) or len(str(row_dict.get(field, "")).strip()) < 10:
+            missing.append(field)
+    
+    # Optional but important fields - warn if missing
+    important_fields = ["petitioner", "respondent", "subject", "date"]
+    missing_important = []
+    for field in important_fields:
+        if not row_dict.get(field) or len(str(row_dict.get(field, "")).strip()) < 2:
+            missing_important.append(field)
+    
+    if missing:
+        return False, f"Missing required fields: {', '.join(missing)}"
+    
+    if missing_important:
+        return True, f"Warning: Missing important fields: {', '.join(missing_important)}"
+    
+    return True, "Metadata valid"
+
+
+def _process_row(row_dict: dict, db: Session) -> tuple[CaseLaw | None, str]:
+    """Process a single row. Returns (case, error_message)."""
     text = row_dict.get("text", "")
     if len(text) < 50:
-        print(f"DEBUG: Skipping row - text too short ({len(text)} chars)")
-        return None
+        return None, f"Text too short ({len(text)} chars)"
+
+    # Validate metadata first
+    is_valid, validation_msg = _validate_metadata(row_dict)
+    if not is_valid:
+        return None, validation_msg
 
     try:
         known_names = [
@@ -114,6 +144,12 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
             raw_text=text[:50000],
             anonymized_text=anon.anonymized_text[:50000],
             pii_map=anon.pii_map,
+            # Preserve original names for display
+            petitioner_original=row_dict.get("petitioner"),
+            respondent_original=row_dict.get("respondent"),
+            judges_original=row_dict.get("judges"),
+            # Mark as success initially
+            ingestion_status="success",
         )
         db.add(case)
         db.flush()
@@ -133,7 +169,12 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
             "respondent": anon_respondent,
             "judges": anon_judges,
         }
-        doc_path = create_document(case.id, anon_case_data, summary)
+        original_names = {
+            "petitioner": row_dict.get("petitioner"),
+            "respondent": row_dict.get("respondent"),
+            "judges": row_dict.get("judges"),
+        }
+        doc_path = create_document(case.id, anon_case_data, summary, original_names)
         case.document_path = str(doc_path)
         print(f"DEBUG: Document created at {doc_path}")
 
@@ -146,12 +187,12 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
         case.faiss_index = faiss_pos
         print(f"DEBUG: Embedding added at position {faiss_pos}")
 
-        return case
+        return case, ""
     except Exception as e:
         print(f"ERROR: Failed to process row: {str(e)}")
         import traceback
         traceback.print_exc()
-        return None
+        return None, str(e)
 
 
 def _generate_summary(anonymized_text: str, model_id: str = "groq/compound") -> str:
@@ -188,32 +229,56 @@ async def bulk_ingest(
     print(f"DEBUG: Pipeline columns: {list(pipeline_df.columns)}")
 
     ingested = 0
-    skipped = 0
+    failed = 0
+    errors = []
+    
     for idx, row in pipeline_df.iterrows():
         row_dict = row_to_dict(row)
         print(f"DEBUG: Processing row {idx}, text length: {len(row_dict.get('text', ''))}")
-        case = _process_row(row_dict, db)
+        case, error_msg = _process_row(row_dict, db)
         if case:
             ingested += 1
             print(f"DEBUG: Successfully ingested case {idx}")
         else:
-            skipped += 1
-            print(f"DEBUG: Skipped case {idx}")
+            failed += 1
+            error_msg = error_msg or "Unknown error"
+            errors.append(f"Row {idx}: {error_msg}")
+            print(f"DEBUG: Failed case {idx}: {error_msg}")
 
+    # Create ingestion log
+    status = "success" if failed == 0 else "partial" if ingested > 0 else "failed"
+    log = IngestionLog(
+        filename=file.filename,
+        file_type="csv",
+        status=status,
+        cases_processed=ingested + failed,
+        cases_failed=failed,
+        error_message="\n".join(errors[:10]) if errors else None,  # Limit error log size
+    )
+    db.add(log)
+    
     db.commit()
-    print(f"DEBUG: Final count - ingested: {ingested}, skipped: {skipped}")
+    print(f"DEBUG: Final count - ingested: {ingested}, failed: {failed}")
 
     return BulkIngestResponse(
         ingested=ingested,
         test_set_size=len(test_df),
-        skipped=skipped,
-        message=f"Ingested {ingested} cases into pipeline. {len(test_df)} cases reserved for LLM testing.",
+        skipped=failed,
+        message=f"Ingested {ingested} cases into pipeline. {failed} cases failed. {len(test_df)} cases reserved for LLM testing.",
     )
 
 
 class PdfIngestResponse(BaseModel):
     success: bool
     case_id: int | None
+    message: str
+
+
+class BulkPdfIngestResponse(BaseModel):
+    success: bool
+    processed: int
+    failed: int
+    errors: list[str]
     message: str
 
 
@@ -234,11 +299,36 @@ async def ingest_pdf(
     try:
         raw_text = extract_text_from_pdf(tmp_path)
         if not raw_text or len(raw_text) < 50:
+            # Log the failure
+            log = IngestionLog(
+                filename=file.filename,
+                file_type="pdf",
+                status="failed",
+                cases_processed=1,
+                cases_failed=1,
+                error_message="Could not extract sufficient text from PDF",
+            )
+            db.add(log)
+            db.commit()
             raise ValueError("Could not extract sufficient text from PDF")
 
         print(f"DEBUG: Extracted {len(raw_text)} chars from PDF. Requesting metadata extraction via LLM...")
         metadata = extract_metadata_via_llm(raw_text)
         print(f"DEBUG: LLM Metadata extraction result: {metadata}")
+
+        # Validate metadata
+        if not metadata or not isinstance(metadata, dict):
+            log = IngestionLog(
+                filename=file.filename,
+                file_type="pdf",
+                status="failed",
+                cases_processed=1,
+                cases_failed=1,
+                error_message="Metadata extraction failed - no valid metadata returned",
+            )
+            db.add(log)
+            db.commit()
+            raise ValueError("Metadata extraction failed - no valid metadata returned")
 
         row_dict = {
             "text": raw_text,
@@ -252,18 +342,148 @@ async def ingest_pdf(
             "verdict": metadata.get("verdict"),
         }
 
-        case = _process_row(row_dict, db)
+        case, error_msg = _process_row(row_dict, db)
         if case:
+            # Log success
+            log = IngestionLog(
+                filename=file.filename,
+                file_type="pdf",
+                status="success",
+                cases_processed=1,
+                cases_failed=0,
+            )
+            db.add(log)
             db.commit()
             return PdfIngestResponse(success=True, case_id=case.id, message="Successfully ingested PDF case.")
         else:
-            return PdfIngestResponse(success=False, case_id=None, message="Failed to process case after metadata extraction.")
+            # Log failure
+            log = IngestionLog(
+                filename=file.filename,
+                file_type="pdf",
+                status="failed",
+                cases_processed=1,
+                cases_failed=1,
+                error_message=error_msg or "Failed to process case after metadata extraction",
+            )
+            db.add(log)
+            db.commit()
+            return PdfIngestResponse(success=False, case_id=None, message=f"Failed to process case: {error_msg}")
             
     except Exception as e:
         print(f"ERROR: Failed to ingest PDF: {str(e)}")
         import traceback
         traceback.print_exc()
+        # Log unexpected errors
+        try:
+            log = IngestionLog(
+                filename=file.filename,
+                file_type="pdf",
+                status="failed",
+                cases_processed=1,
+                cases_failed=1,
+                error_message=f"Unexpected error: {str(e)}",
+            )
+            db.add(log)
+            db.commit()
+        except:
+            pass  # Don't fail the error handling if logging fails
         raise HTTPException(500, f"Error processing PDF: {str(e)}")
+
+
+@app.post("/api/ingest/pdf/bulk", response_model=BulkPdfIngestResponse)
+async def bulk_ingest_pdfs(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    """Bulk ingest multiple PDF files."""
+    if not files:
+        raise HTTPException(400, "No files provided")
+    
+    pdf_files = [f for f in files if f.filename.endswith(".pdf")]
+    if not pdf_files:
+        raise HTTPException(400, "No PDF files provided")
+    
+    if len(pdf_files) != len(files):
+        raise HTTPException(400, f"Only PDF files accepted. {len(files) - len(pdf_files)} non-PDF files were ignored")
+
+    processed = 0
+    failed = 0
+    errors = []
+    
+    for file in pdf_files:
+        try:
+            tmp_path = settings.data_path() / file.filename
+            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_bytes(await file.read())
+
+            print(f"DEBUG: Processing PDF {file.filename} from {tmp_path}")
+            
+            raw_text = extract_text_from_pdf(tmp_path)
+            if not raw_text or len(raw_text) < 50:
+                failed += 1
+                errors.append(f"{file.filename}: Could not extract sufficient text")
+                print(f"DEBUG: Failed {file.filename} - insufficient text")
+                continue
+
+            print(f"DEBUG: Extracted {len(raw_text)} chars from {file.filename}. Extracting metadata...")
+            metadata = extract_metadata_via_llm(raw_text)
+            print(f"DEBUG: Metadata for {file.filename}: {metadata}")
+
+            if not metadata or not isinstance(metadata, dict):
+                failed += 1
+                errors.append(f"{file.filename}: Metadata extraction failed")
+                print(f"DEBUG: Failed {file.filename} - metadata extraction failed")
+                continue
+
+            row_dict = {
+                "text": raw_text,
+                "case_no": metadata.get("case_no"),
+                "date": metadata.get("date"),
+                "petitioner": metadata.get("petitioner"),
+                "respondent": metadata.get("respondent"),
+                "judges": metadata.get("judges"),
+                "subject": metadata.get("subject"),
+                "acts": metadata.get("acts"),
+                "verdict": metadata.get("verdict"),
+            }
+
+            case, error_msg = _process_row(row_dict, db)
+            if case:
+                processed += 1
+                print(f"DEBUG: Successfully ingested {file.filename}")
+            else:
+                failed += 1
+                errors.append(f"{file.filename}: {error_msg or 'Processing failed'}")
+                print(f"DEBUG: Failed {file.filename}: {error_msg}")
+                
+        except Exception as e:
+            failed += 1
+            errors.append(f"{file.filename}: {str(e)}")
+            print(f"ERROR: Failed to ingest {file.filename}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    # Create ingestion log
+    status = "success" if failed == 0 else "partial" if processed > 0 else "failed"
+    log = IngestionLog(
+        filename=f"bulk_upload_{len(pdf_files)}_files",
+        file_type="pdf_bulk",
+        status=status,
+        cases_processed=processed + failed,
+        cases_failed=failed,
+        error_message="\n".join(errors[:10]) if errors else None,
+    )
+    db.add(log)
+    db.commit()
+
+    return BulkPdfIngestResponse(
+        success=processed > 0,
+        processed=processed,
+        failed=failed,
+        errors=errors,
+        message=f"Processed {processed} PDFs successfully. {failed} failed.",
+    )
 
 
 # ─── Cases ────────────────────────────────────────────────────────────────────
@@ -278,9 +498,13 @@ def list_cases(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
             "case_no": c.original_case_no,
             "date": c.judgment_date,
             "subject": c.subject,
+            "petitioner": c.petitioner_original,  # Return original names for display
+            "respondent": c.respondent_original,
+            "judges": c.judges_original,
             "has_document": bool(c.document_path),
             "has_embedding": c.has_embedding,
             "ingested_at": c.ingested_at.isoformat(),
+            "ingestion_status": c.ingestion_status,
         }
         for c in cases
     ]
@@ -298,10 +522,15 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
         "date": case.judgment_date,
         "subject": case.subject,
         "acts_cited": case.acts_cited,
+        "petitioner": case.petitioner_original,  # Return original names for display
+        "respondent": case.respondent_original,
+        "judges": case.judges_original,
         "anonymized_text": case.anonymized_text,
         "document_path": case.document_path,
         "has_embedding": case.has_embedding,
         "ingested_at": case.ingested_at.isoformat(),
+        "ingestion_status": case.ingestion_status,
+        "ingestion_error": case.ingestion_error,
     }
 
 
@@ -367,6 +596,9 @@ def judgement_finder(req: FinderRequest, db: Session = Depends(get_db)):
             "date": case.judgment_date,
             "subject": case.subject,
             "acts_cited": case.acts_cited,
+            "petitioner": case.petitioner_original,  # Return original names for display
+            "respondent": case.respondent_original,
+            "judges": case.judges_original,
             "snippet": (case.anonymized_text or "")[:400] + "...",
             "has_document": bool(case.document_path),
         })
@@ -452,3 +684,23 @@ def list_model_results(case_id: int | None = None, db: Session = Depends(get_db)
 @app.get("/api/models/available")
 def available_models():
     return {"models": MODELS}
+
+
+# ─── Ingestion Logs ─────────────────────────────────────────────────────────────
+
+@app.get("/api/ingestion/logs")
+def list_ingestion_logs(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
+    logs = db.query(IngestionLog).order_by(IngestionLog.created_at.desc()).offset(skip).limit(limit).all()
+    return [
+        {
+            "id": log.id,
+            "filename": log.filename,
+            "file_type": log.file_type,
+            "status": log.status,
+            "cases_processed": log.cases_processed,
+            "cases_failed": log.cases_failed,
+            "error_message": log.error_message,
+            "created_at": log.created_at.isoformat(),
+        }
+        for log in logs
+    ]

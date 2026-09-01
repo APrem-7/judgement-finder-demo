@@ -19,6 +19,15 @@ class CaseLaw(Base):
     ingested_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     has_embedding: Mapped[bool] = mapped_column(default=False)
     faiss_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    
+    # Metadata preservation fields - store original names before anonymization
+    petitioner_original: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    respondent_original: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    judges_original: Mapped[str | None] = mapped_column(Text, nullable=True)
+    
+    # Ingestion status tracking
+    ingestion_status: Mapped[str] = mapped_column(String(50), default="pending")  # 'pending', 'success', 'failed'
+    ingestion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ModelTestResult(Base):
@@ -38,4 +47,17 @@ class ModelTestResult(Base):
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     tokens_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class IngestionLog(Base):
+    __tablename__ = "ingestion_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    file_type: Mapped[str] = mapped_column(String(50))  # 'pdf' or 'csv'
+    status: Mapped[str] = mapped_column(String(50))  # 'success', 'failed', 'partial'
+    cases_processed: Mapped[int] = mapped_column(Integer, default=0)
+    cases_failed: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

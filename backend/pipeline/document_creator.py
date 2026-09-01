@@ -70,13 +70,20 @@ def create_document(
     case_id: int,
     case_data: dict,
     summary: str,
+    original_names: dict | None = None,
 ) -> Path:
     """
     Write a markdown summary document and return its path.
-    case_data keys: date, petitioner, respondent, judges, subject, acts, verdict
+    case_data keys: date, petitioner, respondent, judges, subject, acts, verdict (anonymized)
+    original_names keys: petitioner, respondent, judges (original names for display)
     """
     doc_dir = settings.documents_path()
     doc_path = doc_dir / f"case_{case_id:06d}_summary.md"
+
+    # Use original names for display if available, otherwise fall back to anonymized
+    petitioner_display = (original_names or {}).get("petitioner") or case_data.get("petitioner") or "John Doe"
+    respondent_display = (original_names or {}).get("respondent") or case_data.get("respondent") or "Jane Doe"
+    judges_display = (original_names or {}).get("judges") or case_data.get("judges") or "—"
 
     content = _TEMPLATE.format(
         case_id=f"KS-{case_id:06d}",
@@ -84,9 +91,9 @@ def create_document(
         subject=case_data.get("subject") or "—",
         acts=case_data.get("acts") or "—",
         verdict=case_data.get("verdict") or "—",
-        petitioner=case_data.get("petitioner") or "John Doe",
-        respondent=case_data.get("respondent") or "Jane Doe",
-        judges=case_data.get("judges") or "—",
+        petitioner=petitioner_display,
+        respondent=respondent_display,
+        judges=judges_display,
         summary=summary,
         timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     )
@@ -102,6 +109,9 @@ def create_document(
         "subject": case_data.get("subject"),
         "acts": case_data.get("acts"),
         "verdict": case_data.get("verdict"),
+        "petitioner_original": (original_names or {}).get("petitioner"),
+        "respondent_original": (original_names or {}).get("respondent"),
+        "judges_original": (original_names or {}).get("judges"),
         "document_path": str(doc_path),
         "generated_at": datetime.utcnow().isoformat(),
     }
