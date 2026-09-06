@@ -48,29 +48,53 @@ def _legacy_cache_path() -> Path:
     return settings.vector_store_path() / "vector_cache.npy"
 
 
+def _find_newest_complete_generation() -> int | None:
+    """Find the newest complete generation with both index.faiss and id_map.json."""
+    vector_path = settings.vector_store_path()
+    if not vector_path.exists():
+        return None
+
+    complete_gens = []
+    for item in vector_path.iterdir():
+        if item.is_dir() and item.name.startswith("gen_"):
+            try:
+                gen_num = int(item.name.split("_")[1])
+                ip = _index_path(gen_num)
+                id_map_path = _map_path(gen_num)
+                if ip.exists() and id_map_path.exists():
+                    complete_gens.append(gen_num)
+            except (ValueError, IndexError):
+                pass
+
+    if not complete_gens:
+        return None
+
+    return max(complete_gens)
+
+
 def _get_index() -> faiss.IndexFlatIP:
     global _index, _id_map, _vector_cache, _generation
     if _index is not None:
         return _index
 
     mp = _manifest_path()
-    
+
     # Try to load from manifest first
     if mp.exists():
         try:
             manifest = json.loads(mp.read_text())
             _generation = manifest.get("generation", 0)
-            
+
             gen_dir = _generation_dir(_generation)
             if gen_dir.exists():
                 ip = _index_path(_generation)
                 id_map_path = _map_path(_generation)
                 cp = _cache_path(_generation)
-                
+
                 if ip.exists() and id_map_path.exists():
                     _index = faiss.read_index(str(ip))
                     _id_map = json.loads(id_map_path.read_text())
-                    
+
                     # Rebuild vector cache from persisted file or reconstruct from FAISS index
                     if cp.exists():
                         _vector_cache = np.load(cp, allow_pickle=True).item()
@@ -78,24 +102,48 @@ def _get_index() -> faiss.IndexFlatIP:
                         # Reconstruct cache from FAISS index
                         _vector_cache = {}
                         _reconstruct_cache_from_index()
-                    
+
                     # Validate that all IDs have cached vectors and repair if needed
                     _validate_and_repair_cache()
                     return _index
+                else:
+                    # Manifest generation is incomplete, find newest complete generation
+                    complete_gen = _find_newest_complete_generation()
+                    if complete_gen is not None:
+                        _generation = complete_gen
+                        gen_dir = _generation_dir(_generation)
+                        ip = _index_path(_generation)
+                        id_map_path = _map_path(_generation)
+                        cp = _cache_path(_generation)
+
+                        _index = faiss.read_index(str(ip))
+                        _id_map = json.loads(id_map_path.read_text())
+
+                        # Rebuild vector cache from persisted file or reconstruct from FAISS index
+                        if cp.exists():
+                            _vector_cache = np.load(cp, allow_pickle=True).item()
+                        else:
+                            # Reconstruct cache from FAISS index
+                            _vector_cache = {}
+                            _reconstruct_cache_from_index()
+
+                        # Validate that all IDs have cached vectors and repair if needed
+                        _validate_and_repair_cache()
+                        return _index
         except (json.JSONDecodeError, KeyError, IOError):
             # If manifest is corrupted, fall back to legacy or new index
             pass
-    
+
     # Fall back to legacy files for backward compatibility
     legacy_ip = _legacy_index_path()
     legacy_mp = _legacy_map_path()
     legacy_cp = _legacy_cache_path()
-    
+
     if legacy_ip.exists() and legacy_mp.exists():
         _index = faiss.read_index(str(legacy_ip))
         _id_map = json.loads(legacy_mp.read_text())
         _generation = 0
-        
+
         # Rebuild vector cache from persisted file or reconstruct from FAISS index
         if legacy_cp.exists():
             _vector_cache = np.load(legacy_cp, allow_pickle=True).item()
@@ -103,19 +151,19 @@ def _get_index() -> faiss.IndexFlatIP:
             # Reconstruct cache from FAISS index
             _vector_cache = {}
             _reconstruct_cache_from_index()
-        
+
         # Validate that all IDs have cached vectors and repair if needed
         _validate_and_repair_cache()
-        
+
         # Migrate to versioned storage
         _generation = 1
         _persist()
-        
+
         # Clean up legacy files after successful migration
         _cleanup_legacy_files()
-        
+
         return _index
-    
+
     # Create new index
     _index = faiss.IndexFlatIP(_DIMENSION)
     _id_map = []
@@ -159,7 +207,7 @@ def _cleanup_legacy_files():
         legacy_ip = _legacy_index_path()
         legacy_mp = _legacy_map_path()
         legacy_cp = _legacy_cache_path()
-        
+
         if legacy_ip.exists():
             legacy_ip.unlink()
         if legacy_mp.exists():
@@ -218,43 +266,43 @@ def _persist():
     global _generation
     # Increment generation for this write
     new_generation = _generation + 1
-    
+
     # Create new generation directory
     gen_dir = _generation_dir(new_generation)
     gen_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Write all files to the new generation directory
     ip = _index_path(new_generation)
     mp = _map_path(new_generation)
     cp = _cache_path(new_generation)
-    
+
     try:
         # Write FAISS index
         faiss.write_index(_index, str(ip))
-        
+
         # Write ID map
         mp.write_text(json.dumps(_id_map))
-        
+
         # Write vector cache
         np.save(cp, _vector_cache)
-        
+
         # All files written successfully, now update manifest atomically
         manifest = {"generation": new_generation}
         manifest_path = _manifest_path()
-        
+
         # Write manifest to temporary file first
         temp_manifest_path = manifest_path.with_suffix('.tmp')
         temp_manifest_path.write_text(json.dumps(manifest))
-        
+
         # Atomic rename
         temp_manifest_path.replace(manifest_path)
-        
+
         # Update generation counter only after successful manifest update
         _generation = new_generation
-        
+
         # Clean up old generation directories (keep last 2 for safety)
         _cleanup_old_generations(new_generation)
-        
+
     except Exception as e:
         # If anything fails, clean up the incomplete generation
         import shutil
@@ -269,7 +317,7 @@ def _cleanup_old_generations(current_generation: int):
         vector_path = settings.vector_store_path()
         if not vector_path.exists():
             return
-            
+
         # Find all generation directories
         gen_dirs = []
         for item in vector_path.iterdir():
@@ -279,20 +327,20 @@ def _cleanup_old_generations(current_generation: int):
                     gen_dirs.append((gen_num, item))
                 except (ValueError, IndexError):
                     pass
-        
+
         # Sort by generation number
         gen_dirs.sort(key=lambda x: x[0])
-        
+
         # Keep only the latest 2 generations
         generations_to_keep = gen_dirs[-2:] if len(gen_dirs) >= 2 else gen_dirs
-        
+
         # Remove old generations
         kept_gens = {gen_num for gen_num, _ in generations_to_keep}
         for gen_num, gen_dir in gen_dirs:
             if gen_num not in kept_gens:
                 import shutil
                 shutil.rmtree(gen_dir)
-                
+
     except Exception:
         # If cleanup fails, it's not critical
         pass
