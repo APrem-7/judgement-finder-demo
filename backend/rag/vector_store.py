@@ -37,13 +37,50 @@ def _get_index() -> faiss.IndexFlatIP:
     if ip.exists() and mp.exists():
         _index = faiss.read_index(str(ip))
         _id_map = json.loads(mp.read_text())
-        # Rebuild vector cache from persisted file
+        # Rebuild vector cache from persisted file or reconstruct from FAISS index
         if cp.exists():
             _vector_cache = np.load(cp, allow_pickle=True).item()
+        else:
+            # Reconstruct cache from FAISS index
+            _vector_cache = {}
+            _reconstruct_cache_from_index()
+        
+        # Validate that all IDs have cached vectors and repair if needed
+        _validate_and_repair_cache()
     else:
         _index = faiss.IndexFlatIP(_DIMENSION)
         _id_map = []
     return _index
+
+
+def _reconstruct_cache_from_index():
+    """Rebuild vector cache from FAISS index."""
+    global _index, _id_map, _vector_cache
+    for pos, case_id in enumerate(_id_map):
+        try:
+            vec = _index.reconstruct(pos)
+            _vector_cache[case_id] = vec.copy()
+        except (ValueError, RuntimeError):
+            # If we can't reconstruct, skip this ID
+            pass
+
+
+def _validate_and_repair_cache():
+    """Validate cache has all required vectors, reconstruct missing ones."""
+    global _index, _id_map, _vector_cache
+    valid_ids = []
+    for pos, case_id in enumerate(_id_map):
+        if case_id in _vector_cache:
+            valid_ids.append(case_id)
+        else:
+            try:
+                vec = _index.reconstruct(pos)
+                _vector_cache[case_id] = vec.copy()
+                valid_ids.append(case_id)
+            except (ValueError, RuntimeError):
+                # If we can't reconstruct, skip this ID
+                pass
+    _id_map = valid_ids
 
 
 def add_vector(case_id: int, vector: np.ndarray) -> int:
@@ -115,16 +152,32 @@ def remove_vector(case_id: int) -> bool:
             all_ids = _id_map.copy()
             all_ids.pop(pos)
 
+            # Validate that all retained IDs have cached vectors
+            missing_vectors = [retained_id for retained_id in all_ids if retained_id not in _vector_cache]
+            if missing_vectors:
+                # Try to reconstruct missing vectors from FAISS index
+                for retained_id in missing_vectors:
+                    try:
+                        retained_pos = _id_map.index(retained_id)
+                        vec = idx.reconstruct(retained_pos)
+                        _vector_cache[retained_id] = vec.copy()
+                    except (ValueError, RuntimeError):
+                        # If we can't reconstruct, validation fails
+                        return False
+
+            # Final validation - ensure all retained IDs now have cached vectors
+            if not all(retained_id in _vector_cache for retained_id in all_ids):
+                return False
+
             # Rebuild FAISS index with retained vectors
             _index = faiss.IndexFlatIP(_DIMENSION)
             _id_map = []
 
             # Re-add all retained vectors from cache
             for retained_id in all_ids:
-                if retained_id in _vector_cache:
-                    vec = _vector_cache[retained_id].reshape(1, -1).astype(np.float32)
-                    _index.add(vec)
-                    _id_map.append(retained_id)
+                vec = _vector_cache[retained_id].reshape(1, -1).astype(np.float32)
+                _index.add(vec)
+                _id_map.append(retained_id)
 
             # Remove from cache
             _vector_cache.pop(case_id, None)

@@ -138,8 +138,77 @@ def test_cache_preservation_after_rebuild():
         vector_store._vector_cache = original_vector_cache
 
 
+def test_missing_cache_file():
+    """Test that vector cache is reconstructed from FAISS index when cache file is missing."""
+    # Save original state
+    original_index = vector_store._index
+    original_id_map = vector_store._id_map.copy()
+    original_vector_cache = vector_store._vector_cache.copy()
+    original_persist = vector_store._persist
+
+    # Mock _persist to prevent disk I/O during test
+    def mock_persist():
+        pass
+
+    try:
+        # Reset global state
+        vector_store._index = faiss.IndexFlatIP(vector_store._DIMENSION)
+        vector_store._id_map.clear()
+        vector_store._vector_cache.clear()
+
+        # Mock persistence
+        vector_store._persist = mock_persist
+
+        # Add multiple vectors
+        vec1 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+        vec2 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+        vec3 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+
+        vector_store.add_vector(1, vec1)
+        vector_store.add_vector(2, vec2)
+        vector_store.add_vector(3, vec3)
+
+        # Verify initial state
+        assert vector_store.store_size() == 3
+        assert len(vector_store._id_map) == 3
+        assert vector_store._id_map == [1, 2, 3]
+        assert len(vector_store._vector_cache) == 3
+
+        # Simulate missing cache file by clearing the cache
+        vector_store._vector_cache.clear()
+
+        # Call the reconstruction function directly
+        vector_store._reconstruct_cache_from_index()
+
+        # Verify cache was reconstructed from FAISS index
+        assert len(vector_store._vector_cache) == 3, "Cache should be reconstructed from FAISS index"
+        assert 1 in vector_store._vector_cache
+        assert 2 in vector_store._vector_cache
+        assert 3 in vector_store._vector_cache
+
+        # Verify reconstructed vectors match original vectors
+        assert np.allclose(vector_store._vector_cache[1], vec1)
+        assert np.allclose(vector_store._vector_cache[2], vec2)
+        assert np.allclose(vector_store._vector_cache[3], vec3)
+
+        # Verify that removal still works after cache reconstruction
+        result = vector_store.remove_vector(2)
+        assert result is True
+        assert vector_store.store_size() == 2
+        assert vector_store._id_map == [1, 3]
+
+    finally:
+        # Restore original state
+        vector_store._persist = original_persist
+        vector_store._index = original_index
+        vector_store._id_map = original_id_map
+        vector_store._vector_cache = original_vector_cache
+
+
 if __name__ == "__main__":
     test_middle_vector_removal()
     print("Test passed: middle_vector_removal")
     test_cache_preservation_after_rebuild()
     print("Test passed: cache_preservation_after_rebuild")
+    test_missing_cache_file()
+    print("Test passed: missing_cache_file")
