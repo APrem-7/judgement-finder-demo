@@ -22,16 +22,24 @@ def _map_path() -> Path:
     return settings.vector_store_path() / "id_map.json"
 
 
+def _cache_path() -> Path:
+    return settings.vector_store_path() / "vector_cache.npy"
+
+
 def _get_index() -> faiss.IndexFlatIP:
-    global _index, _id_map
+    global _index, _id_map, _vector_cache
     if _index is not None:
         return _index
 
     ip = _index_path()
     mp = _map_path()
+    cp = _cache_path()
     if ip.exists() and mp.exists():
         _index = faiss.read_index(str(ip))
         _id_map = json.loads(mp.read_text())
+        # Rebuild vector cache from persisted file
+        if cp.exists():
+            _vector_cache = np.load(cp, allow_pickle=True).item()
     else:
         _index = faiss.IndexFlatIP(_DIMENSION)
         _id_map = []
@@ -84,8 +92,10 @@ def search(query_vector: np.ndarray, top_k: int = 5) -> list[dict]:
 def _persist():
     ip = _index_path()
     mp = _map_path()
+    cp = _cache_path()
     faiss.write_index(_index, str(ip))
     mp.write_text(json.dumps(_id_map))
+    np.save(cp, _vector_cache)
 
 
 def remove_vector(case_id: int) -> bool:
@@ -95,30 +105,30 @@ def remove_vector(case_id: int) -> bool:
         idx = _get_index()
         if case_id not in _id_map:
             return False
-        
+
         # Find position of case_id
         pos = _id_map.index(case_id)
-        
+
         # Rebuild index without that entry
         if idx.ntotal > 1:
             # Get all IDs except the one to remove
             all_ids = _id_map.copy()
             all_ids.pop(pos)
-            
+
             # Rebuild FAISS index with retained vectors
             _index = faiss.IndexFlatIP(_DIMENSION)
             _id_map = []
-            
+
             # Re-add all retained vectors from cache
             for retained_id in all_ids:
                 if retained_id in _vector_cache:
                     vec = _vector_cache[retained_id].reshape(1, -1).astype(np.float32)
                     _index.add(vec)
                     _id_map.append(retained_id)
-            
+
             # Remove from cache
             _vector_cache.pop(case_id, None)
-            
+
             _persist()
             return True
         else:
