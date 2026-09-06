@@ -10,6 +10,7 @@ from config import settings
 
 _index: faiss.IndexFlatIP | None = None
 _id_map: list[int] = []          # faiss position → DB case_id
+_vector_cache: dict[int, np.ndarray] = {}  # case_id → vector for rebuilding
 _DIMENSION = 384                  # all-MiniLM-L6-v2 output dim
 
 
@@ -39,22 +40,27 @@ def _get_index() -> faiss.IndexFlatIP:
 
 def add_vector(case_id: int, vector: np.ndarray) -> int:
     """Add a single embedding. Returns FAISS position."""
+    global _vector_cache
     idx = _get_index()
     vec = vector.reshape(1, -1).astype(np.float32)
     idx.add(vec)
     pos = len(_id_map)
     _id_map.append(case_id)
+    _vector_cache[case_id] = vector.copy()
     _persist()
     return pos
 
 
 def add_vectors_batch(case_ids: list[int], vectors: np.ndarray) -> list[int]:
+    global _vector_cache
     idx = _get_index()
     vecs = vectors.astype(np.float32)
     start = len(_id_map)
     idx.add(vecs)
     positions = list(range(start, start + len(case_ids)))
     _id_map.extend(case_ids)
+    for case_id, vec in zip(case_ids, vectors):
+        _vector_cache[case_id] = vec.copy()
     _persist()
     return positions
 
@@ -84,7 +90,7 @@ def _persist():
 
 def remove_vector(case_id: int) -> bool:
     """Remove a vector by case_id. Rebuilds index without that entry."""
-    global _index, _id_map
+    global _index, _id_map, _vector_cache
     try:
         idx = _get_index()
         if case_id not in _id_map:
@@ -95,25 +101,31 @@ def remove_vector(case_id: int) -> bool:
         
         # Rebuild index without that entry
         if idx.ntotal > 1:
-            # Get all vectors except the one to remove
+            # Get all IDs except the one to remove
             all_ids = _id_map.copy()
             all_ids.pop(pos)
             
-            # Need to reload and rebuild - FAISS doesn't support removal
-            # This is expensive but necessary for correctness
+            # Rebuild FAISS index with retained vectors
             _index = faiss.IndexFlatIP(_DIMENSION)
             _id_map = []
             
-            # Re-add all vectors except the removed one
-            # Note: This requires re-embedding, which we can't do here
-            # So we'll just mark it as removed in the map
-            _id_map = all_ids
+            # Re-add all retained vectors from cache
+            for retained_id in all_ids:
+                if retained_id in _vector_cache:
+                    vec = _vector_cache[retained_id].reshape(1, -1).astype(np.float32)
+                    _index.add(vec)
+                    _id_map.append(retained_id)
+            
+            # Remove from cache
+            _vector_cache.pop(case_id, None)
+            
             _persist()
             return True
         else:
             # If only one vector, clear the index
             _index = faiss.IndexFlatIP(_DIMENSION)
             _id_map = []
+            _vector_cache.pop(case_id, None)
             _persist()
             return True
     except Exception:

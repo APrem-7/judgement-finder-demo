@@ -29,7 +29,7 @@
 
 ## Generated Summary
 
-This case involves Income Tax - Transfer Pricing - Arm's Length Price between [ORGANIZATION], New Delhi and [ORGANIZATION]. The key legal issues include Income Tax Act 1961, Section 92C, Transfer Pricing Regulations. The verdict was Appeal disposed of.
+This case involves Income Tax - Transfer Pricing - Arm's Length Price between [ORGANIZATION], [LOCATION] and [ORGANIZATION]. The key legal issues include Income Tax Act 1961, Section 92C, Transfer Pricing Regulations. The verdict was Appeal disposed of.
 
 ---
 

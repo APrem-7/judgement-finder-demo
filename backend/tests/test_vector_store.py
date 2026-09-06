@@ -1,0 +1,55 @@
+"""
+Regression tests for vector_store.py
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import numpy as np
+import faiss
+from rag import vector_store
+
+
+def test_middle_vector_removal():
+    """Test removing a middle vector maintains FAISS position alignment."""
+    # Reset global state
+    vector_store._index = faiss.IndexFlatIP(vector_store._DIMENSION)
+    vector_store._id_map.clear()
+    vector_store._vector_cache.clear()
+    
+    # Add three vectors
+    vec1 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+    vec2 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+    vec3 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+    
+    vector_store.add_vector(1, vec1)
+    vector_store.add_vector(2, vec2)
+    vector_store.add_vector(3, vec3)
+    
+    # Verify initial state
+    assert vector_store.store_size() == 3
+    assert len(vector_store._id_map) == 3
+    assert vector_store._id_map == [1, 2, 3]
+    
+    # Remove middle vector (case_id 2)
+    result = vector_store.remove_vector(2)
+    assert result is True
+    
+    # Verify store_size equals len(_id_map)
+    assert vector_store.store_size() == len(vector_store._id_map), f"store_size={vector_store.store_size()}, len(_id_map)={len(vector_store._id_map)}"
+    assert vector_store.store_size() == 2
+    assert len(vector_store._id_map) == 2
+    assert vector_store._id_map == [1, 3], f"Expected [1, 3], got {vector_store._id_map}"
+    
+    # Verify searches resolve to correct case IDs
+    query_vec = vec1
+    results = vector_store.search(query_vec, top_k=2)
+    result_ids = [r["case_id"] for r in results]
+    assert 1 in result_ids, "Case ID 1 should be in search results"
+    assert 3 in result_ids, "Case ID 3 should be in search results"
+    assert 2 not in result_ids, "Case ID 2 should not be in search results after removal"
+
+
+if __name__ == "__main__":
+    test_middle_vector_removal()
+    print("Test passed: middle_vector_removal")
