@@ -22,7 +22,7 @@ from llm.groq_client import chat
 from llm.model_tester import run_model_test, MODELS
 from llm.prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 from rag.embedder import embed_one, embed
-from rag.vector_store import add_vector, add_vectors_batch, search, store_size
+from rag.vector_store import add_vector, add_vectors_batch, search, store_size, remove_vector
 from rag.finder import find_similar
 
 
@@ -81,6 +81,9 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
         print(f"DEBUG: Skipping row - text too short ({len(text)} chars)")
         return None
 
+    # Create savepoint for this row
+    sp = db.begin_nested()
+    
     try:
         known_names = [
             n for n in [row_dict.get("petitioner"), row_dict.get("respondent"), row_dict.get("judges")]
@@ -101,9 +104,7 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
             judgment_date=row_dict.get("date") or None,
             subject=row_dict.get("subject") or None,
             acts_cited=row_dict.get("acts") or None,
-            raw_text=text[:50000],
             anonymized_text=anon.anonymized_text[:50000],
-            pii_map=anon.pii_map,
         )
         db.add(case)
         db.flush()
@@ -136,11 +137,36 @@ def _process_row(row_dict: dict, db: Session) -> CaseLaw | None:
         case.faiss_index = faiss_pos
         print(f"DEBUG: Embedding added at position {faiss_pos}")
 
+        # Commit savepoint on success
+        sp.commit()
         return case
     except Exception as e:
+        # Rollback savepoint on failure
+        sp.rollback()
         print(f"ERROR: Failed to process row: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        # Cleanup: remove document and metadata files if case was created
+        if 'case' in locals() and case.id:
+            try:
+                from pathlib import Path
+                doc_path = Path(case.document_path) if case.document_path else None
+                meta_path = settings.documents_path() / f"case_{case.id:06d}_meta.json"
+                
+                if doc_path and doc_path.exists():
+                    doc_path.unlink()
+                    print(f"DEBUG: Cleaned up document file for case {case.id}")
+                if meta_path.exists():
+                    meta_path.unlink()
+                    print(f"DEBUG: Cleaned up metadata file for case {case.id}")
+                
+                # Remove FAISS entry
+                remove_vector(case.id)
+                print(f"DEBUG: Cleaned up FAISS entry for case {case.id}")
+            except Exception as cleanup_err:
+                print(f"ERROR: Cleanup failed for case {case.id}: {cleanup_err}")
+        
         return None
 
 
@@ -270,7 +296,7 @@ class FinderRequest(BaseModel):
 
 @app.post("/api/finder/search")
 def judgement_finder(req: FinderRequest, db: Session = Depends(get_db)):
-    print(f"DEBUG: Search request received - query: '{req.query}', top_k: {req.top_k}")
+    print(f"DEBUG: Search request received - query_id: {id(req)}, query_length: {len(req.query)}, top_k: {req.top_k}")
     
     if not req.query.strip():
         raise HTTPException(400, "Query cannot be empty")
