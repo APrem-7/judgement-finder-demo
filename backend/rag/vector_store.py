@@ -108,11 +108,11 @@ def _load_generation(generation: int) -> bool:
         return False
 
 
-def _find_newest_complete_generation() -> int | None:
-    """Find the newest complete generation with both index.faiss and id_map.json."""
+def _find_complete_generations() -> list[int]:
+    """Find all complete generations with both index.faiss and id_map.json, sorted newest to oldest."""
     vector_path = settings.vector_store_path()
     if not vector_path.exists():
-        return None
+        return []
 
     complete_gens = []
     for item in vector_path.iterdir():
@@ -126,10 +126,9 @@ def _find_newest_complete_generation() -> int | None:
             except (ValueError, IndexError):
                 pass
 
-    if not complete_gens:
-        return None
-
-    return max(complete_gens)
+    # Sort descending (newest first)
+    complete_gens.sort(reverse=True)
+    return complete_gens
 
 
 def _get_index() -> faiss.IndexFlatIP:
@@ -144,16 +143,18 @@ def _get_index() -> faiss.IndexFlatIP:
         try:
             manifest = json.loads(mp.read_text())
             target_generation = manifest.get("generation", 0)
-            
+
             # Attempt to load the manifest's target generation
             if _load_generation(target_generation):
                 return _index
-            
-            # If target generation is missing, incomplete, or invalid, find newest complete generation
-            complete_gen = _find_newest_complete_generation()
-            if complete_gen is not None and _load_generation(complete_gen):
-                return _index
-                
+
+            # If target generation is missing, incomplete, or invalid, try all complete generations
+            # in descending order until one successfully validates
+            complete_gens = _find_complete_generations()
+            for gen in complete_gens:
+                if _load_generation(gen):
+                    return _index
+
         except (json.JSONDecodeError, KeyError, IOError):
             # If manifest is corrupted, fall back to legacy or new index
             pass
