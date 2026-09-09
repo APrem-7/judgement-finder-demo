@@ -48,6 +48,66 @@ def _legacy_cache_path() -> Path:
     return settings.vector_store_path() / "vector_cache.npy"
 
 
+def _load_generation(generation: int) -> bool:
+    """Load and validate a specific generation. Returns True if successful, False otherwise."""
+    global _index, _id_map, _vector_cache, _generation
+    
+    gen_dir = _generation_dir(generation)
+    ip = _index_path(generation)
+    id_map_path = _map_path(generation)
+    cp = _cache_path(generation)
+    
+    # Check if all required files exist
+    if not (gen_dir.exists() and ip.exists() and id_map_path.exists()):
+        return False
+    
+    try:
+        # Load FAISS index
+        index = faiss.read_index(str(ip))
+        
+        # Load ID map
+        id_map = json.loads(id_map_path.read_text())
+        
+        # Validate ID map is a list
+        if not isinstance(id_map, list):
+            return False
+        
+        # Validate index and id_map consistency
+        if index.ntotal != len(id_map):
+            return False
+        
+        # Load or reconstruct vector cache
+        if cp.exists():
+            vector_cache = np.load(cp, allow_pickle=True).item()
+            if not isinstance(vector_cache, dict):
+                return False
+        else:
+            # Reconstruct cache from FAISS index
+            vector_cache = {}
+            for pos, case_id in enumerate(id_map):
+                try:
+                    vec = index.reconstruct(pos)
+                    vector_cache[case_id] = vec.copy()
+                except (ValueError, RuntimeError):
+                    # If we can't reconstruct, this generation is invalid
+                    return False
+        
+        # Validate that all IDs in id_map have cached vectors
+        for case_id in id_map:
+            if case_id not in vector_cache:
+                return False
+        
+        # All validations passed, update global state
+        _index = index
+        _id_map = id_map
+        _vector_cache = vector_cache
+        _generation = generation
+        return True
+        
+    except (json.JSONDecodeError, IOError, RuntimeError, ValueError):
+        return False
+
+
 def _find_newest_complete_generation() -> int | None:
     """Find the newest complete generation with both index.faiss and id_map.json."""
     vector_path = settings.vector_store_path()
@@ -83,53 +143,17 @@ def _get_index() -> faiss.IndexFlatIP:
     if mp.exists():
         try:
             manifest = json.loads(mp.read_text())
-            _generation = manifest.get("generation", 0)
-
-            gen_dir = _generation_dir(_generation)
-            if gen_dir.exists():
-                ip = _index_path(_generation)
-                id_map_path = _map_path(_generation)
-                cp = _cache_path(_generation)
-
-                if ip.exists() and id_map_path.exists():
-                    _index = faiss.read_index(str(ip))
-                    _id_map = json.loads(id_map_path.read_text())
-
-                    # Rebuild vector cache from persisted file or reconstruct from FAISS index
-                    if cp.exists():
-                        _vector_cache = np.load(cp, allow_pickle=True).item()
-                    else:
-                        # Reconstruct cache from FAISS index
-                        _vector_cache = {}
-                        _reconstruct_cache_from_index()
-
-                    # Validate that all IDs have cached vectors and repair if needed
-                    _validate_and_repair_cache()
-                    return _index
-                else:
-                    # Manifest generation is incomplete, find newest complete generation
-                    complete_gen = _find_newest_complete_generation()
-                    if complete_gen is not None:
-                        _generation = complete_gen
-                        gen_dir = _generation_dir(_generation)
-                        ip = _index_path(_generation)
-                        id_map_path = _map_path(_generation)
-                        cp = _cache_path(_generation)
-
-                        _index = faiss.read_index(str(ip))
-                        _id_map = json.loads(id_map_path.read_text())
-
-                        # Rebuild vector cache from persisted file or reconstruct from FAISS index
-                        if cp.exists():
-                            _vector_cache = np.load(cp, allow_pickle=True).item()
-                        else:
-                            # Reconstruct cache from FAISS index
-                            _vector_cache = {}
-                            _reconstruct_cache_from_index()
-
-                        # Validate that all IDs have cached vectors and repair if needed
-                        _validate_and_repair_cache()
-                        return _index
+            target_generation = manifest.get("generation", 0)
+            
+            # Attempt to load the manifest's target generation
+            if _load_generation(target_generation):
+                return _index
+            
+            # If target generation is missing, incomplete, or invalid, find newest complete generation
+            complete_gen = _find_newest_complete_generation()
+            if complete_gen is not None and _load_generation(complete_gen):
+                return _index
+                
         except (json.JSONDecodeError, KeyError, IOError):
             # If manifest is corrupted, fall back to legacy or new index
             pass
@@ -140,29 +164,33 @@ def _get_index() -> faiss.IndexFlatIP:
     legacy_cp = _legacy_cache_path()
 
     if legacy_ip.exists() and legacy_mp.exists():
-        _index = faiss.read_index(str(legacy_ip))
-        _id_map = json.loads(legacy_mp.read_text())
-        _generation = 0
+        try:
+            _index = faiss.read_index(str(legacy_ip))
+            _id_map = json.loads(legacy_mp.read_text())
+            _generation = 0
 
-        # Rebuild vector cache from persisted file or reconstruct from FAISS index
-        if legacy_cp.exists():
-            _vector_cache = np.load(legacy_cp, allow_pickle=True).item()
-        else:
-            # Reconstruct cache from FAISS index
-            _vector_cache = {}
-            _reconstruct_cache_from_index()
+            # Rebuild vector cache from persisted file or reconstruct from FAISS index
+            if legacy_cp.exists():
+                _vector_cache = np.load(legacy_cp, allow_pickle=True).item()
+            else:
+                # Reconstruct cache from FAISS index
+                _vector_cache = {}
+                _reconstruct_cache_from_index()
 
-        # Validate that all IDs have cached vectors and repair if needed
-        _validate_and_repair_cache()
+            # Validate that all IDs have cached vectors and repair if needed
+            _validate_and_repair_cache()
 
-        # Migrate to versioned storage
-        _generation = 1
-        _persist()
+            # Migrate to versioned storage
+            _generation = 1
+            _persist()
 
-        # Clean up legacy files after successful migration
-        _cleanup_legacy_files()
+            # Clean up legacy files after successful migration
+            _cleanup_legacy_files()
 
-        return _index
+            return _index
+        except (json.JSONDecodeError, IOError, RuntimeError):
+            # If legacy files are corrupted, fall through to create new index
+            pass
 
     # Create new index
     _index = faiss.IndexFlatIP(_DIMENSION)
@@ -184,21 +212,21 @@ def _reconstruct_cache_from_index():
 
 
 def _validate_and_repair_cache():
-    """Validate cache has all required vectors, reconstruct missing ones."""
+    """Validate cache has all required vectors, reconstruct missing ones.
+    
+    Note: This is only used for legacy file migration. For versioned generations,
+    validation is handled in _load_generation() which rejects invalid generations
+    entirely rather than attempting partial repairs.
+    """
     global _index, _id_map, _vector_cache
-    valid_ids = []
     for pos, case_id in enumerate(_id_map):
-        if case_id in _vector_cache:
-            valid_ids.append(case_id)
-        else:
+        if case_id not in _vector_cache:
             try:
                 vec = _index.reconstruct(pos)
                 _vector_cache[case_id] = vec.copy()
-                valid_ids.append(case_id)
             except (ValueError, RuntimeError):
-                # If we can't reconstruct, skip this ID
-                pass
-    _id_map = valid_ids
+                # If we can't reconstruct, this is a critical error for legacy files
+                raise RuntimeError(f"Cannot reconstruct vector for case_id {case_id} at position {pos}")
 
 
 def _cleanup_legacy_files():

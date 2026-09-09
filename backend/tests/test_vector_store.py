@@ -7,15 +7,41 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import faiss
+import pytest
 from rag import vector_store
+from config import settings
 
 
-def test_middle_vector_removal():
-    """Test removing a middle vector maintains FAISS position alignment."""
-    # Save original state
+@pytest.fixture
+def temp_vector_store(tmp_path, monkeypatch):
+    """Fixture to provide a temporary directory for vector store tests."""
+    # Monkeypatch the vector store path to use temp directory
+    monkeypatch.setattr(settings, 'VECTOR_STORE_PATH', str(tmp_path))
+    
+    # Reset global state before test
     original_index = vector_store._index
     original_id_map = vector_store._id_map.copy()
     original_vector_cache = vector_store._vector_cache.copy()
+    original_generation = vector_store._generation
+    
+    # Clear the actual temp directory
+    if tmp_path.exists():
+        import shutil
+        shutil.rmtree(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    
+    yield tmp_path
+    
+    # Reset global state after test
+    vector_store._index = original_index
+    vector_store._id_map = original_id_map
+    vector_store._vector_cache = original_vector_cache
+    vector_store._generation = original_generation
+
+
+def test_middle_vector_removal(temp_vector_store):
+    """Test removing a middle vector maintains FAISS position alignment."""
+    # Save original state
     original_persist = vector_store._persist
 
     # Mock _persist to prevent disk I/O during test
@@ -66,17 +92,11 @@ def test_middle_vector_removal():
     finally:
         # Restore original state
         vector_store._persist = original_persist
-        vector_store._index = original_index
-        vector_store._id_map = original_id_map
-        vector_store._vector_cache = original_vector_cache
 
 
-def test_cache_preservation_after_rebuild():
+def test_cache_preservation_after_rebuild(temp_vector_store):
     """Test that vector cache is used correctly during index rebuild in remove_vector."""
     # Save original state
-    original_index = vector_store._index
-    original_id_map = vector_store._id_map.copy()
-    original_vector_cache = vector_store._vector_cache.copy()
     original_persist = vector_store._persist
 
     # Mock _persist to prevent disk I/O during test
@@ -133,17 +153,11 @@ def test_cache_preservation_after_rebuild():
     finally:
         # Restore original state
         vector_store._persist = original_persist
-        vector_store._index = original_index
-        vector_store._id_map = original_id_map
-        vector_store._vector_cache = original_vector_cache
 
 
-def test_missing_cache_file():
+def test_missing_cache_file(temp_vector_store):
     """Test that vector cache is reconstructed from FAISS index when cache file is missing."""
     # Save original state
-    original_index = vector_store._index
-    original_id_map = vector_store._id_map.copy()
-    original_vector_cache = vector_store._vector_cache.copy()
     original_persist = vector_store._persist
 
     # Mock _persist to prevent disk I/O during test
@@ -200,21 +214,14 @@ def test_missing_cache_file():
     finally:
         # Restore original state
         vector_store._persist = original_persist
-        vector_store._index = original_index
-        vector_store._id_map = original_id_map
-        vector_store._vector_cache = original_vector_cache
 
 
-def test_interrupted_write_consistency():
+def test_interrupted_write_consistency(temp_vector_store):
     """Test that interrupted writes don't cause mismatched case IDs in search results."""
     import shutil
 
     # Save original state
-    original_index = vector_store._index
-    original_id_map = vector_store._id_map.copy()
-    original_vector_cache = vector_store._vector_cache.copy()
     original_persist = vector_store._persist
-    original_generation = vector_store._generation
 
     # Mock _persist to prevent disk I/O during test
     def mock_persist():
@@ -331,18 +338,85 @@ def test_interrupted_write_consistency():
     finally:
         # Restore original state
         vector_store._persist = original_persist
-        vector_store._index = original_index
-        vector_store._id_map = original_id_map
-        vector_store._vector_cache = original_vector_cache
-        vector_store._generation = original_generation
 
 
-if __name__ == "__main__":
-    test_middle_vector_removal()
-    print("Test passed: middle_vector_removal")
-    test_cache_preservation_after_rebuild()
-    print("Test passed: cache_preservation_after_rebuild")
-    test_missing_cache_file()
-    print("Test passed: missing_cache_file")
-    test_interrupted_write_consistency()
-    print("Test passed: interrupted_write_consistency")
+def test_missing_directory_recovery(temp_vector_store):
+    """Test recovery when manifest points to a non-existent generation directory."""
+    import json
+    
+    # Reset global state
+    vector_store._index = faiss.IndexFlatIP(vector_store._DIMENSION)
+    vector_store._id_map.clear()
+    vector_store._vector_cache.clear()
+    vector_store._generation = 0
+    
+    # Add three vectors to create a valid generation
+    vec1 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+    vec2 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+    vec3 = np.random.rand(vector_store._DIMENSION).astype(np.float32)
+    
+    vector_store.add_vector(1, vec1)
+    vector_store.add_vector(2, vec2)
+    vector_store.add_vector(3, vec3)
+    
+    # Verify initial state - should be generation 3 (3 vectors added)
+    assert vector_store.store_size() == 3
+    assert len(vector_store._id_map) == 3
+    assert vector_store._id_map == [1, 2, 3]
+    assert vector_store._generation == 3
+    
+    # Write manifest.json with generation 4 (which doesn't exist)
+    manifest_path = vector_store._manifest_path()
+    temp_manifest = manifest_path.with_suffix('.tmp')
+    temp_manifest.write_text('{"generation": 4}')
+    temp_manifest.replace(manifest_path)
+    
+    # Clear in-memory state to force reload
+    vector_store._index = None
+    vector_store._id_map = []
+    vector_store._vector_cache = {}
+    vector_store._generation = 0
+    
+    # Reload should detect missing generation 4 and fall back to generation 3
+    idx = vector_store._get_index()
+    
+    # Should have recovered generation 3 with all three cases
+    assert vector_store.store_size() == 3, \
+        f"Store should have 3 vectors after recovery, got {vector_store.store_size()}"
+    assert len(vector_store._id_map) == 3, \
+        f"ID map should have 3 entries after recovery, got {len(vector_store._id_map)}"
+    assert vector_store._id_map == [1, 2, 3], \
+        f"ID map should be [1, 2, 3] after recovery, got {vector_store._id_map}"
+    assert vector_store._generation == 3, \
+        f"Should be generation 3 after recovery, got {vector_store._generation}"
+    
+    # Search with each known vector and verify the expected case ID
+    results1 = vector_store.search(vec1, top_k=1)
+    assert results1[0]["case_id"] == 1, "Vector 1 should return case ID 1"
+    
+    results2 = vector_store.search(vec2, top_k=1)
+    assert results2[0]["case_id"] == 2, "Vector 2 should return case ID 2"
+    
+    results3 = vector_store.search(vec3, top_k=1)
+    assert results3[0]["case_id"] == 3, "Vector 3 should return case ID 3"
+    
+    # Remove case ID 2
+    result = vector_store.remove_vector(2)
+    assert result is True, "Removing case 2 should succeed"
+    
+    # Verify that only IDs 1 and 3 remain searchable
+    assert vector_store.store_size() == 2, \
+        f"Store should have 2 vectors after removal, got {vector_store.store_size()}"
+    assert len(vector_store._id_map) == 2, \
+        f"ID map should have 2 entries after removal, got {len(vector_store._id_map)}"
+    assert vector_store._id_map == [1, 3], \
+        f"ID map should be [1, 3] after removal, got {vector_store._id_map}"
+    
+    # Verify search results after removal
+    results = vector_store.search(vec1, top_k=2)
+    result_ids = [r["case_id"] for r in results]
+    
+    assert 1 in result_ids, "Case ID 1 should be in search results after removal"
+    assert 3 in result_ids, "Case ID 3 should be in search results after removal"
+    assert 2 not in result_ids, "Case ID 2 should not be in search results after removal"
+
