@@ -51,31 +51,31 @@ def _legacy_cache_path() -> Path:
 def _load_generation(generation: int) -> bool:
     """Load and validate a specific generation. Returns True if successful, False otherwise."""
     global _index, _id_map, _vector_cache, _generation
-    
+
     gen_dir = _generation_dir(generation)
     ip = _index_path(generation)
     id_map_path = _map_path(generation)
     cp = _cache_path(generation)
-    
+
     # Check if all required files exist
     if not (gen_dir.exists() and ip.exists() and id_map_path.exists()):
         return False
-    
+
     try:
         # Load FAISS index
         index = faiss.read_index(str(ip))
-        
+
         # Load ID map
         id_map = json.loads(id_map_path.read_text())
-        
+
         # Validate ID map is a list
         if not isinstance(id_map, list):
             return False
-        
+
         # Validate index and id_map consistency
         if index.ntotal != len(id_map):
             return False
-        
+
         # Load or reconstruct vector cache
         if cp.exists():
             vector_cache = np.load(cp, allow_pickle=True).item()
@@ -91,19 +91,19 @@ def _load_generation(generation: int) -> bool:
                 except (ValueError, RuntimeError):
                     # If we can't reconstruct, this generation is invalid
                     return False
-        
+
         # Validate that all IDs in id_map have cached vectors
         for case_id in id_map:
             if case_id not in vector_cache:
                 return False
-        
+
         # All validations passed, update global state
         _index = index
         _id_map = id_map
         _vector_cache = vector_cache
         _generation = generation
         return True
-        
+
     except (json.JSONDecodeError, IOError, RuntimeError, ValueError):
         return False
 
@@ -214,7 +214,7 @@ def _reconstruct_cache_from_index():
 
 def _validate_and_repair_cache():
     """Validate cache has all required vectors, reconstruct missing ones.
-    
+
     Note: This is only used for legacy file migration. For versioned generations,
     validation is handled in _load_generation() which rejects invalid generations
     entirely rather than attempting partial repairs.

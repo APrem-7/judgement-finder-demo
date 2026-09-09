@@ -17,21 +17,20 @@ def temp_vector_store(tmp_path, monkeypatch):
     """Fixture to provide a temporary directory for vector store tests."""
     # Monkeypatch the vector store path to use temp directory
     monkeypatch.setattr(settings, 'VECTOR_STORE_PATH', str(tmp_path))
-    
+
     # Reset global state before test
     original_index = vector_store._index
     original_id_map = vector_store._id_map.copy()
     original_vector_cache = vector_store._vector_cache.copy()
     original_generation = vector_store._generation
-    
+
     # Clear the actual temp directory
     if tmp_path.exists():
         import shutil
         shutil.rmtree(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
-    
+
     yield tmp_path
-    
     # Reset global state after test
     vector_store._index = original_index
     vector_store._id_map = original_id_map
@@ -531,4 +530,3 @@ def test_invalid_generation_fallback_recovery(temp_vector_store):
     # Clean up the invalid generation
     if gen2_dir.exists():
         shutil.rmtree(gen2_dir)
-

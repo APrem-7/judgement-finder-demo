@@ -51,7 +51,6 @@ def load_dataset(csv_path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             df = pd.read_csv(csv_path, low_memory=False, engine='python', on_bad_lines='skip')
         except TypeError:
             df = pd.read_csv(csv_path, low_memory=False, engine='python', error_bad_lines=False, warn_bad_lines=True)
-    
     df = df.dropna(how="all").reset_index(drop=True)
 
     # Build normalised dataframe
