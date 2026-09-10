@@ -11,12 +11,12 @@ def migrate():
     """Add new columns to case_laws table and create ingestion_logs table."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
+    
     try:
         # Check if columns already exist
         cursor.execute("PRAGMA table_info(case_laws)")
         columns = [row[1] for row in cursor.fetchall()]
-
+        
         # Add new columns to case_laws if they don't exist
         new_columns = [
             ("petitioner_original", "VARCHAR(255)"),
@@ -25,17 +25,17 @@ def migrate():
             ("ingestion_status", "VARCHAR(50) DEFAULT 'pending'"),
             ("ingestion_error", "TEXT"),
         ]
-
+        
         for col_name, col_type in new_columns:
             if col_name not in columns:
                 print(f"Adding column {col_name}...")
                 cursor.execute(f"ALTER TABLE case_laws ADD COLUMN {col_name} {col_type}")
             else:
                 print(f"Column {col_name} already exists, skipping...")
-
+        
         # Create ingestion_logs table if it doesn't exist
         cursor.execute("""
-            SELECT name FROM sqlite_master
+            SELECT name FROM sqlite_master 
             WHERE type='table' AND name='ingestion_logs'
         """)
         if not cursor.fetchone():
@@ -54,10 +54,9 @@ def migrate():
             """)
         else:
             print("ingestion_logs table already exists, skipping...")
-
+        
         conn.commit()
         print("Migration completed successfully!")
-
     except Exception as e:
         conn.rollback()
         print(f"Migration failed: {e}")

@@ -19,6 +19,15 @@ class CaseLaw(Base):
     ingested_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     has_embedding: Mapped[bool] = mapped_column(default=False)
     faiss_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    
+    # Metadata preservation fields - store original names before anonymization
+    petitioner_original: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    respondent_original: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    judges_original: Mapped[str | None] = mapped_column(Text, nullable=True)
+    
+    # Ingestion status tracking
+    ingestion_status: Mapped[str] = mapped_column(String(50), default="pending")  # 'pending', 'success', 'failed'
+    ingestion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Metadata preservation fields - store original names before anonymization
     petitioner_original: Mapped[str | None] = mapped_column(String(255), nullable=True)
